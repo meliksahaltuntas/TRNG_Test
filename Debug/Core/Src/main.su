@@ -1,0 +1,12 @@
+../Drivers/STM32WBxx_HAL_Driver/Inc/stm32wbxx_ll_bus.h:539:22:LL_AHB2_GRP1_EnableClock	24	static
+../Core/Src/main.c:102:24:now_ms	8	static
+../Core/Src/main.c:107:13:button_pressed_event	16	static
+../Core/Src/main.c:130:13:mode2_reset_state	8	static
+../Core/Src/main.c:140:13:toggle_mode	16	static
+../Core/Src/main.c:152:13:force_set_mode	24	static
+../Core/Src/main.c:170:5:main	24	static
+../Core/Src/main.c:268:13:MX_GPIO_Init	32	static
+../Core/Src/main.c:299:13:MX_RNG_Init	8	static
+../Core/Src/main.c:310:13:MX_USART1_UART_Init	8	static
+../Core/Src/main.c:327:6:SystemClock_Config	112	static
+../Core/Src/main.c:357:6:Error_Handler	4	static,ignoring_inline_asm
