@@ -7,11 +7,11 @@
   * Bu program STM32WB55RG üzerinde çalışır.
   *
   * Özellikler:
-  * - PD0 buton ile mod değiştirilebilir (debounce ile). ÇALIŞAN KOD V1
+  * - PD0 buton ile mod değiştirilebilir (debounce ile). ÇALIŞAN KOD V2
   * - Mode 0: LED2 her saniye yanıp söner.
-  * - Mode 1: RNG ile 1-10 arasında sayı üretilir. LED2 bu sayıya göre yanıp söner.
-  *           Döngü bitince LED1 bir kez yanıp söner.
-  * - LED3, RNG hatası durumunda yanıp söner.
+  * - Mode 1: LED3 bir kere yanar, LED2 RNG ile belirlenen sayıda yanıp söner,
+  *           LED1 ise işin bittiğini belirtir.
+  * - LED3 her mod değişiminde yanıp söner.
   * - UART1 üzerinden mesaj gönderilir.
   *
   ******************************************************************************
@@ -41,28 +41,28 @@
 #define BUTTON_DEBOUNCE_MS 50U
 
 #define MODE0_BLINK_MS      1000U
-#define RNG_LED_ON_MS       300U
-#define RNG_LED_OFF_MS      300U
+#define RNG_LED_ON_MS       50U
+#define RNG_LED_OFF_MS      50U
 #define RNG_POST_WAIT_MS    1000U
 #define LED3_ON_MS          500U
-
+#define LED3_TOGGLE_MS      200U
 /* USER CODE END PD */
+
 /* USER CODE BEGIN ET */
 typedef enum
 {
     M2_IDLE = 0,
+    M2_LED3_ON,
     M2_BLINKING,
     M2_LED1_ON,
     M2_WAIT
 } mode2_state_t;
-
 /* USER CODE END ET */
-
 
 /* Private variables ---------------------------------------------------------*/
 RNG_HandleTypeDef hrng;
 UART_HandleTypeDef huart1;
-/* USER CODE BEGINS PV */
+/* USER CODE BEGIN PV */
 volatile uint8_t mode = 0;           /* 0 = Mode0, 1 = Mode1 */
 volatile uint8_t debugToggle = 0;
 volatile int8_t debugForceMode = -1;
@@ -79,9 +79,11 @@ static uint32_t m2_nextAction = 0;
 static uint32_t m2_blinksRemain = 0;
 static uint8_t m2_ledOn = 0;
 
+static uint32_t m2_led3EndTime = 0; // LED3 kontrolü için
+static uint32_t m2_modeChangeEndTime = 0; // mod değişimi sonrası LED3
+
 static char uartMsg[128];
 /* USER CODE END PV */
-
 
 /* Private function prototypes -----------------------------------------------*/
 
@@ -133,6 +135,7 @@ static void mode2_reset_state(void)
     m2_nextAction = 0;
     m2_blinksRemain = 0;
     m2_ledOn = 0;
+    m2_led3EndTime = 0;
 
     HAL_GPIO_WritePin(LED_GPIO_PORT, LED2_PIN | LED1_PIN | LED3_PIN, GPIO_PIN_RESET);
 }
@@ -144,6 +147,10 @@ static void toggle_mode(void)
     m0_lastToggle = now_ms();
     m0_ledState = 0;
     HAL_GPIO_WritePin(LED_GPIO_PORT, LED2_PIN, GPIO_PIN_RESET);
+
+    // LED3 mod değişiminde yanıp sönsün
+    HAL_GPIO_WritePin(LED_GPIO_PORT, LED3_PIN, GPIO_PIN_SET);
+    m2_modeChangeEndTime = now_ms() + LED3_ON_MS;
 
     int len = snprintf(uartMsg, sizeof(uartMsg), "Mode toggled -> %u\r\n", (unsigned)mode);
     if(len>0) HAL_UART_Transmit(&huart1, (uint8_t*)uartMsg, (uint16_t)len, HAL_MAX_DELAY);
@@ -157,6 +164,10 @@ static void force_set_mode(uint8_t m)
     m0_lastToggle = now_ms();
     m0_ledState = 0;
     HAL_GPIO_WritePin(LED_GPIO_PORT, LED2_PIN, GPIO_PIN_RESET);
+
+    // LED3 mod değişiminde yanıp sönsün
+    HAL_GPIO_WritePin(LED_GPIO_PORT, LED3_PIN, GPIO_PIN_SET);
+    m2_modeChangeEndTime = now_ms() + LED3_ON_MS;
 
     int len = snprintf(uartMsg, sizeof(uartMsg), "Mode forced -> %u\r\n", (unsigned)mode);
     if(len>0) HAL_UART_Transmit(&huart1, (uint8_t*)uartMsg, (uint16_t)len, HAL_MAX_DELAY);
@@ -192,6 +203,13 @@ int main(void)
 
         uint32_t t = now_ms();
 
+        // Mod değişimi LED3 kontrolü
+        if(m2_modeChangeEndTime && t >= m2_modeChangeEndTime)
+        {
+            HAL_GPIO_WritePin(LED_GPIO_PORT, LED3_PIN, GPIO_PIN_RESET);
+            m2_modeChangeEndTime = 0;
+        }
+
         if(mode == 0) // Mode 0: LED2 yanıp söner
         {
             if(t - m0_lastToggle >= MODE0_BLINK_MS)
@@ -207,24 +225,34 @@ int main(void)
             {
                 case M2_IDLE:
                 {
-                    uint32_t rnd;
-                    if(HAL_RNG_GenerateRandomNumber(&hrng, &rnd) != HAL_OK)
-                    {
-                        HAL_GPIO_WritePin(LED_GPIO_PORT, LED3_PIN, GPIO_PIN_SET);
-                        HAL_Delay(LED3_ON_MS);
-                        HAL_GPIO_WritePin(LED_GPIO_PORT, LED3_PIN, GPIO_PIN_RESET);
-                        break;
-                    }
-                    m2_blinksRemain = (rnd % 10) + 1;
-                    m2_state = M2_BLINKING;
-                    m2_ledOn = 0;
-                    m2_nextAction = t;
-
-                    snprintf(uartMsg, sizeof(uartMsg), "Random Number: %lu, LED2 blinks: %lu\r\n",
-                             rnd, m2_blinksRemain);
-                    HAL_UART_Transmit(&huart1, (uint8_t*)uartMsg, strlen(uartMsg), HAL_MAX_DELAY);
+                    // LED3 Mode 1 başında yanacak
+                    HAL_GPIO_WritePin(LED_GPIO_PORT, LED3_PIN, GPIO_PIN_SET);
+                    m2_led3EndTime = t + LED3_ON_MS;
+                    m2_state = M2_LED3_ON;
                 }
                 break;
+
+                case M2_LED3_ON:
+                    if(t >= m2_led3EndTime)
+                    {
+                        HAL_GPIO_WritePin(LED_GPIO_PORT, LED3_PIN, GPIO_PIN_RESET);
+                        uint32_t rnd;
+                        if(HAL_RNG_GenerateRandomNumber(&hrng, &rnd) != HAL_OK)
+                        {
+                            HAL_GPIO_WritePin(LED_GPIO_PORT, LED3_PIN, GPIO_PIN_SET);
+                            m2_led3EndTime = t + LED3_ON_MS;
+                            break;
+                        }
+                        m2_blinksRemain = (rnd % 10) + 1;
+                        m2_state = M2_BLINKING;
+                        m2_ledOn = 0;
+                        m2_nextAction = t;
+
+                        snprintf(uartMsg, sizeof(uartMsg), "Random Number: %lu, LED2 blinks: %lu\r\n",
+                                 rnd, m2_blinksRemain);
+                        HAL_UART_Transmit(&huart1, (uint8_t*)uartMsg, strlen(uartMsg), HAL_MAX_DELAY);
+                    }
+                    break;
 
                 case M2_BLINKING:
                     if(t >= m2_nextAction)
@@ -237,7 +265,7 @@ int main(void)
                             if(m2_blinksRemain == 0)
                             {
                                 m2_state = M2_LED1_ON;
-                                m2_nextAction = t + LED3_ON_MS;
+                                m2_nextAction = t + RNG_POST_WAIT_MS;
                                 HAL_GPIO_WritePin(LED_GPIO_PORT, LED1_PIN, GPIO_PIN_SET);
                                 break;
                             }
@@ -264,6 +292,7 @@ int main(void)
     }
 }
 
+
 /* GPIO Initialization Function */
 static void MX_GPIO_Init(void)
 {
@@ -283,7 +312,7 @@ static void MX_GPIO_Init(void)
     /* Button pin */
     GPIO_InitStruct.Pin = BUTTON_PIN;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pull = GPIO_PULLUP; // <-- Pull-up ekledik
     HAL_GPIO_Init(BUTTON_PORT, &GPIO_InitStruct);
 
     /* UART1 pins PB6/PB7 alternate function setup */
@@ -310,7 +339,7 @@ static void MX_RNG_Init(void)
 static void MX_USART1_UART_Init(void)
 {
     huart1.Instance = USART1;
-    huart1.Init.BaudRate = 115200;
+    huart1.Init.BaudRate = 1200;
     huart1.Init.WordLength = UART_WORDLENGTH_8B;
     huart1.Init.StopBits = UART_STOPBITS_1;
     huart1.Init.Parity = UART_PARITY_NONE;
