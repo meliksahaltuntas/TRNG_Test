@@ -6,14 +6,6 @@
   *
   * Bu program STM32WB55RG üzerinde çalışır.
   *
-  * Özellikler:
-  * - PD0 buton ile mod değiştirilebilir (debounce ile). ÇALIŞAN KOD V2
-  * - Mode 0: LED2 her saniye yanıp söner.
-  * - Mode 1: LED3 bir kere yanar, LED2 RNG ile belirlenen sayıda yanıp söner,
-  *           LED1 ise işin bittiğini belirtir.
-  * - LED3 her mod değişiminde yanıp söner.
-  * - UART1 üzerinden mesaj gönderilir.
-  *
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -26,6 +18,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>   // <-- EKLENDİ: strlen vb. için
 /* USER CODE END Includes */
 
 /* Private define ------------------------------------------------------------*/
@@ -62,7 +55,10 @@ typedef enum
 /* Private variables ---------------------------------------------------------*/
 RNG_HandleTypeDef hrng;
 UART_HandleTypeDef huart1;
+
 /* USER CODE BEGIN PV */
+DMA_HandleTypeDef hdma_usart1_tx; // <-- EKLENDİ: DMA handle
+
 volatile uint8_t mode = 0;           /* 0 = Mode0, 1 = Mode1 */
 volatile uint8_t debugToggle = 0;
 volatile int8_t debugForceMode = -1;
@@ -87,12 +83,13 @@ static char uartMsg[128];
 
 /* Private function prototypes -----------------------------------------------*/
 
-/* USER CODE BEGIN PFP */
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_RNG_Init(void);
 static void MX_USART1_UART_Init(void);
 
+/* USER CODE BEGIN PFP */
+static void MX_DMA_Init(void); // <-- EKLENDİ: prototype
 static inline uint32_t now_ms(void);
 static bool button_pressed_event(void);
 static void mode2_reset_state(void);
@@ -140,6 +137,27 @@ static void mode2_reset_state(void)
     HAL_GPIO_WritePin(LED_GPIO_PORT, LED2_PIN | LED1_PIN | LED3_PIN, GPIO_PIN_RESET);
 }
 
+/* Helper: güvenli DMA ile gönder (eğer DMA meşgulse blocking fallback uygula) */
+static void uart_send_dma_safe(const char *s, int len)
+{
+    if (len <= 0) return;
+    uint16_t ulen = (uint16_t)len;
+    /* Eğer UART hazırsa DMA ile gönder */
+    if (HAL_UART_GetState(&huart1) == HAL_UART_STATE_READY)
+    {
+        if (HAL_UART_Transmit_DMA(&huart1, (uint8_t*)s, ulen) != HAL_OK)
+        {
+            /* Eğer DMA başlatılamadıysa kısa blocking fallback */
+            HAL_UART_Transmit(&huart1, (uint8_t*)s, ulen, 100);
+        }
+    }
+    else
+    {
+        /* DMA meşgulse küçük timeout ile blocking gönder */
+        HAL_UART_Transmit(&huart1, (uint8_t*)s, ulen, 100);
+    }
+}
+
 static void toggle_mode(void)
 {
     mode ^= 1u; // Toggle 0 <-> 1
@@ -153,7 +171,7 @@ static void toggle_mode(void)
     m2_modeChangeEndTime = now_ms() + LED3_ON_MS;
 
     int len = snprintf(uartMsg, sizeof(uartMsg), "Mode toggled -> %u\r\n", (unsigned)mode);
-    if(len>0) HAL_UART_Transmit(&huart1, (uint8_t*)uartMsg, (uint16_t)len, HAL_MAX_DELAY);
+    if(len>0) uart_send_dma_safe(uartMsg, len); // <-- DEGİŞTİ: DMA güvenli gönderim kullan
 }
 
 static void force_set_mode(uint8_t m)
@@ -170,7 +188,7 @@ static void force_set_mode(uint8_t m)
     m2_modeChangeEndTime = now_ms() + LED3_ON_MS;
 
     int len = snprintf(uartMsg, sizeof(uartMsg), "Mode forced -> %u\r\n", (unsigned)mode);
-    if(len>0) HAL_UART_Transmit(&huart1, (uint8_t*)uartMsg, (uint16_t)len, HAL_MAX_DELAY);
+    if(len>0) uart_send_dma_safe(uartMsg, len); // <-- DEGİŞTİ
 }
 /* USER CODE END 0 */
 
@@ -184,6 +202,8 @@ int main(void)
     SystemClock_Config();
 
     MX_GPIO_Init();
+
+    MX_DMA_Init();            // <-- EKLENDİ: DMA ilk başlatılıyor (UART init'den önce çağrılması tavsiye edilir)
     MX_RNG_Init();
     MX_USART1_UART_Init();
 
@@ -248,9 +268,9 @@ int main(void)
                         m2_ledOn = 0;
                         m2_nextAction = t;
 
-                        snprintf(uartMsg, sizeof(uartMsg), "Random Number: %lu, LED2 blinks: %lu\r\n",
+                        int len = snprintf(uartMsg, sizeof(uartMsg), "Random Number: %lu, LED2 blinks: %lu\r\n",
                                  rnd, m2_blinksRemain);
-                        HAL_UART_Transmit(&huart1, (uint8_t*)uartMsg, strlen(uartMsg), HAL_MAX_DELAY);
+                        if(len > 0) uart_send_dma_safe(uartMsg, len); // <-- DEGİŞTİ: DMA güvenli gönderim
                     }
                     break;
 
@@ -335,6 +355,41 @@ static void MX_RNG_Init(void)
     }
 }
 
+/* DMA Initialization Function (USART1 TX) */
+static void MX_DMA_Init(void)
+{
+    /* Enable clocks for DMAMUX + DMA controller */
+#ifdef __HAL_RCC_DMAMUX1_CLK_ENABLE
+    __HAL_RCC_DMAMUX1_CLK_ENABLE();
+#endif
+    __HAL_RCC_DMA1_CLK_ENABLE();
+
+    /* Configure the DMA handle for USART1_TX */
+    hdma_usart1_tx.Instance = DMA1_Channel4; // <-- yaygın seçim; MCU'na göre farklı olabilir
+#ifdef DMA_REQUEST_USART1_TX
+    hdma_usart1_tx.Init.Request = DMA_REQUEST_USART1_TX; // DMAMUX request (bazı HAL'larda mevcut)
+#endif
+    hdma_usart1_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    hdma_usart1_tx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_usart1_tx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_usart1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart1_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_usart1_tx.Init.Mode = DMA_NORMAL;
+    hdma_usart1_tx.Init.Priority = DMA_PRIORITY_LOW;
+
+    if (HAL_DMA_Init(&hdma_usart1_tx) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* Link DMA handle to UART handle */
+    __HAL_LINKDMA(&huart1, hdmatx, hdma_usart1_tx);
+
+    /* Enable and set DMA IRQ to a lower priority */
+    HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
+}
+
 /* USART1 Initialization Function */
 static void MX_USART1_UART_Init(void)
 {
@@ -352,9 +407,24 @@ static void MX_USART1_UART_Init(void)
     }
 }
 
-/* System Clock Configuration */
+/* DMA IRQ Handler (örnek) */
+void DMA1_Channel4_IRQHandler(void)
+{
+    HAL_DMA_IRQHandler(&hdma_usart1_tx);
+}
+
+/* UART TX tamamlandığında çağrılan callback (isteğe göre işaretleme yap) */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        /* Burada istersen bir flag set edebilirsin; demo için boş bırakıyorum */
+    }
+}
+
 void SystemClock_Config(void)
 {
+    /* (Mevcut SystemClock_Config()'unu aynen kullan) */
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
     RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
